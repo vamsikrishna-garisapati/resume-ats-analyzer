@@ -105,6 +105,10 @@ Open the URL shown in the terminal (usually `http://localhost:8501`).
 
 > **Note:** `python-dotenv` loads `.env` locally. On Streamlit Cloud, use **Secrets** instead of committing `.env`.
 
+### Deploy failed on `requirements.txt` (invalid requirement / UTF-16)
+
+If logs show garbage like `\x00s\x00t\x00r\x00e\x00a\x00m\x00l\x00i\x00t`, the file was saved as **UTF-16**. It must be **UTF-8** (ASCII is fine). In VS Code / Cursor: bottom status bar → click encoding → **Save with Encoding** → **UTF-8**. Then commit and push again.
+
 ## Git: “dubious ownership” on Windows
 
 If `git add` fails with *detected dubious ownership*, allow this directory once:
