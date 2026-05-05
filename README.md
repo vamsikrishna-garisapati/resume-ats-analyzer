@@ -71,7 +71,7 @@ Alternatively you can set `GOOGLE_API_KEY` — the app accepts either name.
 ### 5. Run the app
 
 ```bash
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
 Open the URL shown in the terminal (usually `http://localhost:8501`).
@@ -80,7 +80,7 @@ Open the URL shown in the terminal (usually `http://localhost:8501`).
 
 ```text
 .
-├── app.py                 # Streamlit UI
+├── streamlit_app.py       # Streamlit UI (matches Streamlit Cloud default name)
 ├── requirements.txt       # Direct Python dependencies
 ├── .env.example           # Example env (no secrets)
 ├── utils/
@@ -93,8 +93,8 @@ Open the URL shown in the terminal (usually `http://localhost:8501`).
 
 ## Deploying (Streamlit Community Cloud)
 
-1. Push this repo to GitHub.
-2. In [Streamlit Cloud](https://share.streamlit.io/), create an app pointing at `app.py`.
+1. Push this repo to GitHub (so `streamlit_app.py` exists on the branch you select).
+2. In [Streamlit Cloud](https://share.streamlit.io/), create an app and set **Main file path** to **`streamlit_app.py`** (Streamlit’s default).
 3. Under **Settings → Secrets**, add:
 
    ```toml
