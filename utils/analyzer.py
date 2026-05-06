@@ -5,6 +5,16 @@ from datetime import date
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
+from pydantic import ValidationError
+
+from utils.analysis_schema import (
+    MAX_EVIDENCE_ROWS,
+    MAX_IMPROVED_BULLETS,
+    MAX_SKILL_ROADMAPS,
+    ATSResult,
+    ats_result_json_schema_for_gemini,
+)
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -16,42 +26,153 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 MODEL_ID = "gemini-2.5-flash"
 
-PROMPT = """
-You are an expert ATS resume reviewer.
-Today is {today}.
-Resume: {resume}
-Job Description: {jd}
 
-Critical rules:
-- Do not fabricate facts, dates, or "assumed corrections".
-- Do not mark a date range as "future" unless its start date is actually after Today.
+def _genai_json_config() -> types.GenerateContentConfig:
+    return types.GenerateContentConfig(
+        temperature=0.1,
+        response_mime_type="application/json",
+        response_schema=ats_result_json_schema_for_gemini(),
+    )
+
+
+_EVALUATOR_RULES = """You are an expert ATS resume evaluator, career coach, and resume optimization specialist.
+
+Your task is to evaluate a candidate's resume against a specific job description and return ONLY valid JSON matching the response JSON schema. Do not include markdown, explanations, commentary, or code fences.
+
+Today is {today_iso}.
+
+Context for this request:
+- Fresher mode: {fresher_mode} (when true, treat projects, internships, coursework, certifications, hackathons, volunteering, and academic work as valid proof of capability.)
+- Maximum evidence rows: {max_evidence}
+- Maximum skill roadmaps: {max_roadmaps}
+- Maximum improved bullets: {max_bullets}
+
+{indian_context_section}
+
+{fresher_mode_section}
+
+Evaluation rules:
+1. Compare the resume directly against the job description.
+2. Prioritize the most important job requirements first in evidence_matches.
+3. For fresher/student candidates (fresher mode true), treat projects, internships, coursework, certifications, hackathons, volunteering, and academic work as valid proof of capability.
+4. If fresher mode is false, still include fresher_insights, but set profile_type to "general" unless the resume is clearly student or intern focused.
+5. Do not treat keyword mentions as strong evidence unless the resume shows usage, context, project work, scope, or measurable impact.
+6. Do not upgrade vague claims such as "familiar with" into strong proficiency.
+7. Keep feedback practical, specific, and tailored to this exact job.
+8. weak_sections must be an array of strings only (each string names a weak area or section in plain language).
+
+Scoring guidance:
+- ats_score: Overall job-match score from 0 to 100.
+- skills: Relevance and coverage of required technical/domain skills.
+- experience: Work, internship, project, coursework, or practical proof relevant to the JD.
+- projects: Strength, relevance, clarity, and impact of projects.
+- format: ATS readability, structure, clarity, section organization, keyword placement, and bullet quality.
+
+Match status rules for evidence_matches:
+- "yes": Clear evidence exists in the resume.
+- "weak": Skill is mentioned or implied, but lacks concrete proof, scope, project usage, or measurable detail.
+- "no": Requirement is not evidenced in the resume.
+
+Date and factual integrity:
+- Do not fabricate facts, dates, or assumed corrections.
+- Do not mark a date range as future unless its start date is actually after Today.
 - If dates are ambiguous, say they need confirmation instead of guessing exact replacements.
-- Avoid words like "assume", "probably", or "likely" for factual corrections.
+- Avoid words like assume, probably, or likely for factual corrections.
 
-Return ONLY valid JSON:
-{{
-  "ats_score": 0-100,
-  "section_scores": {{
-    "skills": 0-100,
-    "experience": 0-100,
-    "projects": 0-100,
-    "format": 0-100
-  }},
-  "overall_feedback": "string",
-  "matched_skills": [],
-  "missing_skills": [],
-  "weak_sections": [],
-  "improvement_suggestions": [],
-  "recommended_keywords": [],
-  "rewritten_summary": "string",
-  "improved_bullets": [{{"original":"","improved":""}}],
-  "final_recommendation": "string"
-}}
+Honesty (all modes):
+- Do not fabricate skills, companies, projects, internships, metrics, URLs, certifications, or experience.
+- Every match must be traceable to the resume text.
+- resume_evidence must come only from the resume; if absent, use: Not evidenced.
+- If a GitHub, LinkedIn, portfolio, or repo is not present in the resume text, do not claim it exists.
+- Do not invent GitHub/LinkedIn evidence unless URLs or handles appear in the resume text.
+- honest_resume_bullet_after_completion must be a bullet the candidate may add only after completing the mini-project; do not present it as employment or fake experience.
+- If the resume has thin experience and fresher mode is true, do not punish unfairly; evaluate internships, projects, coursework, and certifications as practical evidence.
+- Keep all suggestions realistic, ethical, and achievable.
 
-You MUST include section_scores with exactly these four keys (lowercase): skills, experience, projects, format.
-Each value must be an integer 0-100 that matches your critique (if ats_score is high, section scores cannot all be zero).
-weak_sections may be strings or objects like {{"area": "Work Experience", "suggestion": "..."}}.
+Hard constraints:
+- section_scores must contain exactly these lowercase keys: skills, experience, projects, format. All score values must be integers from 0 to 100.
+- evidence_matches must contain at most {max_evidence} rows.
+- skill_gap_roadmaps must contain at most {max_roadmaps} items and must address only missing or weak JD requirements reflected in evidence_matches.
+- improved_bullets must contain at most {max_bullets} pairs and must rewrite only bullets that already exist in the resume.
+- Each skill_gap_roadmaps[].learning_plan must contain between 3 and 7 strings (inclusive).
+- weak_sections entries must be plain strings (not objects).
+
+The resume text and job description follow this message under the headings "## Resume text" and "## Job description".
 """
+
+
+def build_analysis_prompt(
+    *,
+    today_iso: str,
+    resume: str,
+    jd: str,
+    fresher_mode: bool,
+    indian_context: bool,
+) -> str:
+    if fresher_mode:
+        fresher_mode_section = (
+            "FRESHER/STUDENT MODE IS ON: Prioritize projects, internships, certifications, "
+            "coursework, hackathons, academic achievements, final-year or mini projects, and any "
+            "GitHub or LinkedIn URLs or handles present in the resume text. Do not judge the "
+            "candidate like a mid-career professional when formal work experience is sparse. "
+            "For section_scores.experience, internships plus relevant projects and volunteering "
+            "count as experience."
+        )
+    else:
+        fresher_mode_section = (
+            "FRESHER MODE IS OFF: Use a balanced professional lens. Still fill evidence_matches "
+            "and skill_gap_roadmaps. Set fresher_insights.profile_type to \"general\" unless the "
+            "resume is clearly student or intern focused."
+        )
+
+    if indian_context:
+        indian_context_section = (
+            "INDIAN CAMPUS / ENTRY CONTEXT: Prefer clarity for campus placements, internships, "
+            "and service-based or startup entry roles (for example clear CGPA if stated, project "
+            "depth, technologies used). Do not invent TCS, Infosys, Wipro, or other employer "
+            "experience or credentials."
+        )
+    else:
+        indian_context_section = ""
+
+    rules = _EVALUATOR_RULES.format(
+        today_iso=today_iso,
+        fresher_mode="true" if fresher_mode else "false",
+        indian_context_section=indian_context_section,
+        fresher_mode_section=fresher_mode_section,
+        max_evidence=MAX_EVIDENCE_ROWS,
+        max_roadmaps=MAX_SKILL_ROADMAPS,
+        max_bullets=MAX_IMPROVED_BULLETS,
+    )
+    return (
+        rules
+        + "\n\n## Resume text\n\n"
+        + resume
+        + "\n\n## Job description\n\n"
+        + jd
+    )
+
+
+_STRUCTURED_REPAIR_PROMPT = """Fix the JSON so it validates against the same schema used for structured output.
+
+Rules:
+- Return only valid JSON (no markdown fences, no commentary).
+- Preserve the intended meaning of the original where possible.
+- Fill missing required fields with honest empty strings or empty arrays where appropriate.
+- Do not invent resume evidence or employers.
+- evidence_matches: at most {max_evidence} items.
+- skill_gap_roadmaps: at most {max_roadmaps} items; each learning_plan must have 3 to 7 steps.
+- improved_bullets: at most {max_bullets} items.
+
+Validation error:
+{error}
+
+Invalid or partial JSON:
+---
+{invalid_json}
+---
+"""
+
 
 _MONTH_MAP = {
     "january": 1,
@@ -67,6 +188,51 @@ _MONTH_MAP = {
     "november": 11,
     "december": 12,
 }
+
+
+def _strip_json_fences(text: str) -> str:
+    t = text.strip()
+    t = t.removeprefix("```json").removeprefix("```JSON").removeprefix("```")
+    t = t.removesuffix("```").strip()
+    return t
+
+
+def _parse_and_validate_ats(text: str) -> ATSResult:
+    raw = _strip_json_fences(text)
+    return ATSResult.model_validate_json(raw)
+
+
+def _repair_structured_response(invalid_text: str, error: str) -> ATSResult:
+    prompt = _STRUCTURED_REPAIR_PROMPT.format(
+        error=error[:8000],
+        invalid_json=invalid_text[:120000],
+        max_evidence=MAX_EVIDENCE_ROWS,
+        max_roadmaps=MAX_SKILL_ROADMAPS,
+        max_bullets=MAX_IMPROVED_BULLETS,
+    )
+    response = client.models.generate_content(
+        model=MODEL_ID,
+        contents=prompt,
+        config=_genai_json_config(),
+    )
+    return _parse_and_validate_ats(response.text or "{}")
+
+
+def _minimal_parse_failure_result(message: str) -> dict:
+    return finalize_analysis_result(
+        {
+            "ats_score": 0,
+            "overall_feedback": message,
+            "matched_skills": [],
+            "missing_skills": [],
+            "weak_sections": [],
+            "improvement_suggestions": [],
+            "recommended_keywords": [],
+            "rewritten_summary": "",
+            "improved_bullets": [],
+            "final_recommendation": "Try analyzing again. If this persists, shorten the resume or job description.",
+        }
+    )
 
 
 def _extract_month_year_dates(text: str) -> list[date]:
@@ -93,6 +259,18 @@ def _suggestion_text(item) -> str | None:
     return None
 
 
+def _weak_section_to_str(item) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        area = item.get("area") or ""
+        sug = item.get("suggestion") or ""
+        if area and sug:
+            return f"{area}: {sug}"
+        return str(sug or area or "")
+    return str(item)
+
+
 def _looks_like_false_future_flag(text: str, today: date) -> bool:
     lower = text.lower()
     if "future" not in lower:
@@ -102,22 +280,36 @@ def _looks_like_false_future_flag(text: str, today: date) -> bool:
     if not mentioned_dates:
         return False
 
-    # Keep warning only if at least one mentioned date is genuinely in the future.
     has_true_future = any(d > today for d in mentioned_dates)
     return not has_true_future
 
 
+def _normalize_weak_sections_list(result: dict) -> None:
+    raw = result.get("weak_sections")
+    if not isinstance(raw, list):
+        result["weak_sections"] = []
+        return
+    result["weak_sections"] = [_weak_section_to_str(v) for v in raw]
+
+
 def _post_validate_result(result: dict, today: date) -> dict:
+    _normalize_weak_sections_list(result)
     for key in ("improvement_suggestions", "weak_sections"):
         values = result.get(key, [])
         if not isinstance(values, list):
             continue
         kept = []
         for v in values:
-            text = v if isinstance(v, str) else _suggestion_text(v)
-            if isinstance(text, str) and _looks_like_false_future_flag(text, today):
-                continue
-            kept.append(v)
+            if key == "weak_sections":
+                text = v if isinstance(v, str) else _weak_section_to_str(v)
+                if isinstance(text, str) and _looks_like_false_future_flag(text, today):
+                    continue
+                kept.append(text)
+            else:
+                text = v if isinstance(v, str) else _suggestion_text(v)
+                if isinstance(text, str) and _looks_like_false_future_flag(text, today):
+                    continue
+                kept.append(v)
         result[key] = kept
     return result
 
@@ -169,7 +361,6 @@ def _is_missing_or_empty(val) -> bool:
 
 
 def _merge_key_aliases(d: dict) -> dict:
-    """Map common alternate JSON keys from the model (camelCase, etc.)."""
     out = dict(d)
     aliases = (
         ("atsScore", "ats_score"),
@@ -177,6 +368,9 @@ def _merge_key_aliases(d: dict) -> dict:
         ("ats", "ats_score"),
         ("sectionScores", "section_scores"),
         ("section_scores_detail", "section_scores"),
+        ("fresherInsights", "fresher_insights"),
+        ("evidenceMatches", "evidence_matches"),
+        ("skillGapRoadmaps", "skill_gap_roadmaps"),
     )
     for alt, canonical in aliases:
         if alt in out and (
@@ -187,7 +381,6 @@ def _merge_key_aliases(d: dict) -> dict:
 
 
 def _unwrap_nested_payload(d: dict) -> dict:
-    """Merge fields from common wrapper objects (e.g. {\"analysis\": {...}})."""
     out = dict(d)
     for wrap in ("data", "result", "analysis", "response", "output"):
         inner = out.get(wrap)
@@ -201,7 +394,6 @@ def _unwrap_nested_payload(d: dict) -> dict:
 
 
 def _parse_section_scores_raw(raw) -> dict[str, int]:
-    """Accept dict (any key casing), or list of {{section, score}} objects."""
     out: dict[str, int] = {}
     if isinstance(raw, list):
         for item in raw:
@@ -256,7 +448,6 @@ def _normalize_section_scores(result: dict) -> dict:
 
     ats = _coerce_ats_value(result.get("ats_score"))
 
-    # Model often omits section_scores or uses wrong shape → all zeros. Align with overall score.
     if ats > 0 and all(v == 0 for v in normalized.values()):
         normalized = {k: ats for k in defaults}
 
@@ -264,28 +455,225 @@ def _normalize_section_scores(result: dict) -> dict:
     return result
 
 
+def _canonical_match_status(raw) -> str:
+    if raw is None:
+        return "no"
+    s = str(raw).lower().strip()
+    if s in ("yes", "y", "true", "matched", "strong", "full"):
+        return "yes"
+    if s in ("weak", "partial", "low", "maybe", "limited"):
+        return "weak"
+    if s in ("no", "n", "false", "missing", "none", "not"):
+        return "no"
+    if "weak" in s:
+        return "weak"
+    if "yes" in s or "match" in s:
+        return "yes"
+    return "no"
+
+
+def _default_per_section_notes() -> dict[str, str]:
+    return {
+        "projects": "",
+        "internships": "",
+        "certifications": "",
+        "technical_skills": "",
+        "education": "",
+        "links_github_linkedin": "",
+    }
+
+
+def _default_fresher_insights() -> dict:
+    return {
+        "profile_type": "general",
+        "strongest_section": "",
+        "strongest_section_why": "",
+        "experience_substitute": "",
+        "per_section_notes": _default_per_section_notes(),
+        "priority_actions": [],
+    }
+
+
+def _normalize_fresher_insights(raw) -> dict:
+    base = _default_fresher_insights()
+    if not isinstance(raw, dict):
+        return base
+    out = dict(base)
+    pt = raw.get("profile_type")
+    if isinstance(pt, str) and pt.strip():
+        out["profile_type"] = pt.strip()
+    for key in (
+        "strongest_section",
+        "strongest_section_why",
+        "experience_substitute",
+    ):
+        v = raw.get(key)
+        if isinstance(v, str):
+            out[key] = v.strip()
+    notes = raw.get("per_section_notes")
+    pn = _default_per_section_notes()
+    if isinstance(notes, dict):
+        for k in pn:
+            val = notes.get(k)
+            if isinstance(val, str):
+                pn[k] = val.strip()
+    out["per_section_notes"] = pn
+    pa = raw.get("priority_actions")
+    if isinstance(pa, list):
+        out["priority_actions"] = [
+            str(x).strip() for x in pa if str(x).strip()
+        ]
+    return out
+
+
+def _normalize_evidence_matches(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    rows = []
+    for item in raw[:MAX_EVIDENCE_ROWS]:
+        if not isinstance(item, dict):
+            continue
+        req = item.get("requirement") or item.get("jd_requirement") or ""
+        rows.append(
+            {
+                "requirement": str(req).strip(),
+                "match_status": _canonical_match_status(
+                    item.get("match_status") or item.get("status")
+                ),
+                "resume_evidence": str(
+                    item.get("resume_evidence") or item.get("evidence") or ""
+                ).strip(),
+                "where_in_resume": str(
+                    item.get("where_in_resume")
+                    or item.get("location")
+                    or item.get("section")
+                    or ""
+                ).strip(),
+            }
+        )
+    return [r for r in rows if r["requirement"]]
+
+
+def _normalize_skill_gap_roadmaps(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw[:MAX_SKILL_ROADMAPS]:
+        if not isinstance(item, dict):
+            continue
+        skill = item.get("skill_or_requirement") or item.get("skill") or ""
+        skill = str(skill).strip()
+        if not skill:
+            continue
+        mp = item.get("mini_project")
+        if not isinstance(mp, dict):
+            mp = {}
+        stack = mp.get("suggested_stack") or mp.get("stack") or []
+        if not isinstance(stack, list):
+            stack = [str(stack)]
+        stack = [str(s).strip() for s in stack if str(s).strip()]
+        plan = item.get("learning_plan") or item.get("steps") or []
+        if isinstance(plan, str):
+            plan = [plan]
+        if not isinstance(plan, list):
+            plan = []
+        plan = [str(p).strip() for p in plan if str(p).strip()]
+        out.append(
+            {
+                "skill_or_requirement": skill,
+                "why_it_matters_for_this_role": str(
+                    item.get("why_it_matters_for_this_role") or ""
+                ).strip(),
+                "learning_plan": plan[:10],
+                "mini_project": {
+                    "title": str(mp.get("title") or "").strip(),
+                    "description": str(mp.get("description") or "").strip(),
+                    "suggested_stack": stack[:12],
+                    "demo_idea": str(mp.get("demo_idea") or "").strip(),
+                },
+                "honest_resume_bullet_after_completion": str(
+                    item.get("honest_resume_bullet_after_completion")
+                    or item.get("resume_bullet_after_completion")
+                    or ""
+                ).strip(),
+            }
+        )
+    return out
+
+
+def _cap_improved_bullets(result: dict) -> dict:
+    bullets = result.get("improved_bullets")
+    if not isinstance(bullets, list):
+        result["improved_bullets"] = []
+        return result
+    capped = []
+    for b in bullets[:MAX_IMPROVED_BULLETS]:
+        if not isinstance(b, dict):
+            continue
+        capped.append(
+            {
+                "original": str(b.get("original", "")).strip(),
+                "improved": str(b.get("improved", "")).strip(),
+            }
+        )
+    result["improved_bullets"] = capped
+    return result
+
+
 def finalize_analysis_result(result: dict) -> dict:
     """
-    Normalize keys, ATS, and section scores. Safe to call on fresh API output or stale
-    Streamlit session_state so the UI never shows all-zero sections when ATS > 0.
+    Normalize keys, ATS, section scores, fresher_insights, evidence_matches,
+    and skill_gap_roadmaps. Safe for fresh API output or stale session_state.
     """
     if not isinstance(result, dict):
         return result
     out = _unwrap_nested_payload(_merge_key_aliases(result))
     out["ats_score"] = _coerce_ats_value(out.get("ats_score"))
     _normalize_section_scores(out)
+    _normalize_weak_sections_list(out)
+    out["fresher_insights"] = _normalize_fresher_insights(out.get("fresher_insights"))
+    out["evidence_matches"] = _normalize_evidence_matches(out.get("evidence_matches"))
+    out["skill_gap_roadmaps"] = _normalize_skill_gap_roadmaps(
+        out.get("skill_gap_roadmaps")
+    )
+    _cap_improved_bullets(out)
     return out
 
 
-def analyze(resume_text: str, jd_text: str) -> dict:
+def analyze(
+    resume_text: str,
+    jd_text: str,
+    *,
+    fresher_mode: bool = True,
+    indian_context: bool = False,
+) -> dict:
     today = date.today()
+    today_iso = today.isoformat()
+    prompt = build_analysis_prompt(
+        today_iso=today_iso,
+        resume=resume_text,
+        jd=jd_text,
+        fresher_mode=fresher_mode,
+        indian_context=indian_context,
+    )
+    cfg = _genai_json_config()
     response = client.models.generate_content(
         model=MODEL_ID,
-        contents=PROMPT.format(
-            today=today.isoformat(), resume=resume_text, jd=jd_text
-        ),
+        contents=prompt,
+        config=cfg,
     )
-    raw = response.text.strip().removeprefix("```json").removesuffix("```").strip()
-    parsed = json.loads(raw)
-    parsed = finalize_analysis_result(parsed)
+    text = (response.text or "").strip()
+
+    try:
+        ats = _parse_and_validate_ats(text)
+    except (json.JSONDecodeError, ValidationError, ValueError) as e:
+        try:
+            ats = _repair_structured_response(text, str(e))
+        except (json.JSONDecodeError, ValidationError, ValueError, TypeError, AttributeError):
+            parsed = _minimal_parse_failure_result(
+                "The model returned invalid or incomplete JSON. A schema repair pass also failed."
+            )
+            return _post_validate_result(parsed, today)
+
+    parsed = finalize_analysis_result(ats.model_dump(mode="python"))
     return _post_validate_result(parsed, today)
