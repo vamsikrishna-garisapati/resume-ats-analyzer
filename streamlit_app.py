@@ -118,7 +118,7 @@ def _show_evidence_table(rows: list):
             "Resume evidence": [r.get("resume_evidence", "") for r in rows],
             "Where in resume": [r.get("where_in_resume", "") for r in rows],
         },
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -130,7 +130,10 @@ def _show_skill_roadmaps(roadmaps: list):
         "Suggested bullets are for after you complete the work — we do not invent past experience."
     )
     if not roadmaps:
-        st.caption("No roadmaps returned.")
+        st.caption(
+            "No roadmaps in this run. Re-run **Analyze** after updating the app — roadmaps should "
+            "appear for JD gaps shown as weak or no match in the evidence table."
+        )
         return
     for i, rm in enumerate(roadmaps, 1):
         if not isinstance(rm, dict):
@@ -214,12 +217,20 @@ def show_report(result: dict, job_description: str):
     col_a, col_b = st.columns(2)
     with col_a:
         st.success("Matched skills")
-        for skill in result.get("matched_skills", []):
-            st.write(f"- {skill}")
+        matched = result.get("matched_skills") or []
+        if matched:
+            for skill in matched:
+                st.write(f"- {skill}")
+        else:
+            st.caption("No matched skills listed — check the evidence table for where proof shows up.")
     with col_b:
         st.error("Missing or weak skills (summary)")
-        for skill in result.get("missing_skills", []):
-            st.write(f"- {skill}")
+        missing = result.get("missing_skills") or []
+        if missing:
+            for skill in missing:
+                st.write(f"- {skill}")
+        else:
+            st.caption("None summarized here — gaps may still appear in evidence rows and roadmaps.")
 
     st.subheader("Recommended keywords")
     kws = result.get("recommended_keywords") or []
@@ -237,14 +248,31 @@ def show_report(result: dict, job_description: str):
         st.caption("No weak sections flagged.")
 
     st.subheader("Improvement suggestions")
-    for idx, tip in enumerate(result.get("improvement_suggestions", []), 1):
-        st.write(f"{idx}. {tip}")
+    tips = result.get("improvement_suggestions") or []
+    if tips:
+        for idx, tip in enumerate(tips, 1):
+            st.write(f"{idx}. {tip}")
+    else:
+        st.caption("No numbered suggestions returned — see overall feedback and weak sections above.")
 
     st.subheader("Bullet point rewrites (honest)")
-    for bullet in result.get("improved_bullets", []):
-        st.markdown(f"**Before:** {bullet.get('original', '')}")
-        st.markdown(f"**After:** `{bullet.get('improved', '')}`")
-        st.divider()
+    bullets = result.get("improved_bullets") or []
+    if bullets:
+        for bullet in bullets:
+            if not isinstance(bullet, dict):
+                continue
+            st.markdown(f"**Before:** {bullet.get('original', '')}")
+            after = bullet.get("improved", "") or ""
+            if after.strip():
+                st.markdown(f"**After:** `{after}`")
+            else:
+                st.caption("After: (no rewrite text returned for this bullet.)")
+            st.divider()
+    else:
+        st.caption(
+            "No bullet rewrites returned. The model only rewrites bullets it can quote from your "
+            "resume without inventing facts — try a resume with clearer project or internship bullets."
+        )
 
     st.subheader("Rewritten summary")
     rewritten_summary = result.get("rewritten_summary", "")

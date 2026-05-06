@@ -13,7 +13,6 @@ from utils.analysis_schema import (
     MAX_IMPROVED_BULLETS,
     MAX_SKILL_ROADMAPS,
     ATSResult,
-    ats_result_json_schema_for_gemini,
 )
 
 load_dotenv()
@@ -28,16 +27,17 @@ MODEL_ID = "gemini-2.5-flash"
 
 
 def _genai_json_config() -> types.GenerateContentConfig:
+    # Omit response_schema: Gemini often returns 400 "too many states" for nested
+    # Pydantic JSON Schemas. Prompt defines shape; ATSResult validates after parse.
     return types.GenerateContentConfig(
         temperature=0.1,
         response_mime_type="application/json",
-        response_schema=ats_result_json_schema_for_gemini(),
     )
 
 
 _EVALUATOR_RULES = """You are an expert ATS resume evaluator, career coach, and resume optimization specialist.
 
-Your task is to evaluate a candidate's resume against a specific job description and return ONLY valid JSON matching the response JSON schema. Do not include markdown, explanations, commentary, or code fences.
+Your task is to evaluate a candidate's resume against a specific job description and return ONLY valid JSON with the object shape and field rules below. Do not include markdown, explanations, commentary, or code fences.
 
 Today is {today_iso}.
 
@@ -97,6 +97,21 @@ Hard constraints:
 - Each skill_gap_roadmaps[].learning_plan must contain between 3 and 7 strings (inclusive).
 - weak_sections entries must be plain strings (not objects).
 
+Output shape (critical):
+- Use these exact snake_case root keys so parsers can read your JSON: ats_score, section_scores,
+  overall_feedback, matched_skills, missing_skills, weak_sections, improvement_suggestions,
+  recommended_keywords, rewritten_summary, improved_bullets, final_recommendation,
+  fresher_insights, evidence_matches, skill_gap_roadmaps.
+- Each skill_gap_roadmaps[] object MUST include the string field "skill_or_requirement" (name the JD gap),
+  plus "learning_plan" (array of 3-7 short steps), "why_it_matters_for_this_role", "mini_project"
+  (object with title, description, suggested_stack, demo_idea), and "honest_resume_bullet_after_completion".
+- If any evidence_matches row has match_status "weak" or "no", include at least one skill_gap_roadmaps
+  item for that gap (up to the max), unless every requirement is clearly matched.
+- recommended_keywords: include 5-15 short phrases taken from the JD (skills, tools, domains) the
+  candidate could truthfully align with; do not leave this array empty unless the JD has no skills text.
+- improved_bullets: each entry must have non-empty "original" (verbatim from the resume) and non-empty
+  "improved"; if none qualify, use an empty array [] — do not emit placeholder objects.
+
 The resume text and job description follow this message under the headings "## Resume text" and "## Job description".
 """
 
@@ -153,7 +168,7 @@ def build_analysis_prompt(
     )
 
 
-_STRUCTURED_REPAIR_PROMPT = """Fix the JSON so it validates against the same schema used for structured output.
+_STRUCTURED_REPAIR_PROMPT = """Fix the JSON so it validates as the ATS analysis object (snake_case keys from the evaluator prompt).
 
 Rules:
 - Return only valid JSON (no markdown fences, no commentary).
@@ -368,6 +383,15 @@ def _merge_key_aliases(d: dict) -> dict:
         ("ats", "ats_score"),
         ("sectionScores", "section_scores"),
         ("section_scores_detail", "section_scores"),
+        ("overallFeedback", "overall_feedback"),
+        ("matchedSkills", "matched_skills"),
+        ("missingSkills", "missing_skills"),
+        ("weakSections", "weak_sections"),
+        ("improvementSuggestions", "improvement_suggestions"),
+        ("recommendedKeywords", "recommended_keywords"),
+        ("rewrittenSummary", "rewritten_summary"),
+        ("improvedBullets", "improved_bullets"),
+        ("finalRecommendation", "final_recommendation"),
         ("fresherInsights", "fresher_insights"),
         ("evidenceMatches", "evidence_matches"),
         ("skillGapRoadmaps", "skill_gap_roadmaps"),
@@ -561,7 +585,17 @@ def _normalize_skill_gap_roadmaps(raw) -> list[dict]:
     for item in raw[:MAX_SKILL_ROADMAPS]:
         if not isinstance(item, dict):
             continue
-        skill = item.get("skill_or_requirement") or item.get("skill") or ""
+        skill = (
+            item.get("skill_or_requirement")
+            or item.get("skillOrRequirement")
+            or item.get("skill")
+            or item.get("gap")
+            or item.get("gap_title")
+            or item.get("requirement")
+            or item.get("title")
+            or item.get("topic")
+            or ""
+        )
         skill = str(skill).strip()
         if not skill:
             continue
@@ -610,12 +644,11 @@ def _cap_improved_bullets(result: dict) -> dict:
     for b in bullets[:MAX_IMPROVED_BULLETS]:
         if not isinstance(b, dict):
             continue
-        capped.append(
-            {
-                "original": str(b.get("original", "")).strip(),
-                "improved": str(b.get("improved", "")).strip(),
-            }
-        )
+        orig = str(b.get("original", b.get("before", ""))).strip()
+        imp = str(b.get("improved", b.get("after", ""))).strip()
+        if not orig:
+            continue
+        capped.append({"original": orig, "improved": imp})
     result["improved_bullets"] = capped
     return result
 

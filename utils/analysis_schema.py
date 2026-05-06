@@ -117,42 +117,5 @@ class ATSResult(BaseModel):
 
 
 def ats_result_json_schema() -> dict:
-    """Full JSON Schema from Pydantic (strict; may be too heavy for Gemini serving)."""
+    """JSON Schema from Pydantic (for tooling/tests; Gemini calls omit response_schema)."""
     return ATSResult.model_json_schema()
-
-
-_GEMINI_PRUNED_SCHEMA_KEYS = frozenset(
-    {
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "minLength",
-        "maxLength",
-        "pattern",
-        "format",
-        "minItems",
-        "maxItems",
-        "uniqueItems",
-        "enum",
-        "const",
-    }
-)
-
-
-def _relax_json_schema_for_gemini(node: object) -> object:
-    """Drop constraint keys that inflate Gemini's schema state space (400 too many states)."""
-    if isinstance(node, dict):
-        return {
-            k: _relax_json_schema_for_gemini(v)
-            for k, v in node.items()
-            if k not in _GEMINI_PRUNED_SCHEMA_KEYS
-        }
-    if isinstance(node, list):
-        return [_relax_json_schema_for_gemini(x) for x in node]
-    return node
-
-
-def ats_result_json_schema_for_gemini() -> dict:
-    """Looser schema for Gemini structured JSON; enforce limits with Pydantic after parse."""
-    return _relax_json_schema_for_gemini(ATSResult.model_json_schema())
