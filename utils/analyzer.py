@@ -1,12 +1,21 @@
 import json
 import os
 import re
+import time
+from random import random
 from datetime import date
+from typing import Any
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pydantic import ValidationError
+
+try:
+    from google.genai.errors import APIError, ServerError
+except Exception:  # pragma: no cover
+    APIError = Exception  # type: ignore[misc,assignment]
+    ServerError = Exception  # type: ignore[misc,assignment]
 
 from utils.analysis_schema import (
     MAX_EVIDENCE_ROWS,
@@ -33,6 +42,49 @@ def _genai_json_config() -> types.GenerateContentConfig:
         temperature=0.1,
         response_mime_type="application/json",
     )
+
+
+def _generate_content_with_retry(
+    *,
+    prompt: str,
+    model: str,
+    config: types.GenerateContentConfig,
+    max_attempts: int = 3,
+) -> Any:
+    """
+    Calls Gemini with a small retry loop for transient 5xx/server errors.
+
+    The google-genai SDK already retries internally, but Streamlit Cloud users
+    still see occasional ServerError; this makes the user-visible experience
+    more resilient.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
+        except ServerError as e:
+            last_err = e
+        except APIError as e:
+            # Retry only when it's likely transient (5xx / server-side).
+            status = getattr(e, "status_code", None)
+            if isinstance(status, int) and 500 <= status <= 599:
+                last_err = e
+            else:
+                raise
+
+        if attempt < max_attempts:
+            # Exponential backoff with a little jitter.
+            delay_s = (2 ** (attempt - 1)) + (random() * 0.25)
+            time.sleep(delay_s)
+
+    raise RuntimeError(
+        "Gemini API failed with a transient server error after multiple retries. "
+        "Please try again in a moment."
+    ) from last_err
 
 
 _EVALUATOR_RULES = """You are an expert ATS resume evaluator, career coach, and resume optimization specialist.
@@ -690,11 +742,7 @@ def analyze(
         indian_context=indian_context,
     )
     cfg = _genai_json_config()
-    response = client.models.generate_content(
-        model=MODEL_ID,
-        contents=prompt,
-        config=cfg,
-    )
+    response = _generate_content_with_retry(prompt=prompt, model=MODEL_ID, config=cfg)
     text = (response.text or "").strip()
 
     try:

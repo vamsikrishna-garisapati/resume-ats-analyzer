@@ -310,12 +310,20 @@ def show_report(result: dict, job_description: str):
 if st.button("Analyze") and file and jd:
     with st.spinner("Analyzing..."):
         resume_text = extract_text(file)
-        result = analyze(
-            resume_text,
-            jd,
-            fresher_mode=st.session_state.get("fresher_mode", True),
-            indian_context=st.session_state.get("indian_context", False),
-        )
+        try:
+            result = analyze(
+                resume_text,
+                jd,
+                fresher_mode=st.session_state.get("fresher_mode", True),
+                indian_context=st.session_state.get("indian_context", False),
+            )
+        except Exception as e:
+            st.error(
+                "Analysis failed while calling the Gemini API. "
+                "Please try again in a moment. If it keeps failing, verify your API key and model access."
+            )
+            st.caption(f"Error: {type(e).__name__}: {e}")
+            st.stop()
     st.session_state["analysis_result"] = result
     st.session_state["cover_letter"] = ""
     st.session_state["last_jd"] = jd
